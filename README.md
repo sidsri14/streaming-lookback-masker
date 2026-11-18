@@ -1,5 +1,9 @@
 # Streaming Lookback Secret Masker (POC for Sparcle / Bolt)
 
+[![CI](https://github.com/sidsri14/streaming-lookback-masker/actions/workflows/ci.yml/badge.svg)](https://github.com/sidsri14/streaming-lookback-masker/actions/workflows/ci.yml)
+[![DriftGuard CI](https://img.shields.io/badge/CI-DriftGuard%20Protected-blue?logo=github)](https://github.com/marketplace/actions/driftguard-ci-guard)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A bounded-buffer sliding-window streaming secret masker in Rust, designed specifically for HTTP/SSE LLM gateways and proxies (such as Bolt and Agent Gateway).
 
 It guarantees that sensitive tokens (API keys, Bearer tokens, private keys) are reliably detected and masked even when partitioned across arbitrary chunk boundaries in streaming Server-Sent Events (SSE).

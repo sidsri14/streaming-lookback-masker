@@ -14,3 +14,13 @@ jobs:
     - uses: dtolnay/rust-toolchain@stable
     - name: Run tests
       run: cargo test --verbose
+
+  driftguard:
+    name: DriftGuard Environment & Contract CI Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run DriftGuard
+        uses: sidsri14/driftguard@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
