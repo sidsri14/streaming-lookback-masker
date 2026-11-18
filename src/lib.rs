@@ -7,7 +7,6 @@ pub struct MaskRule {
     pub pattern: Regex,
     pub replacement: String,
     /// Maximum expected length of a secret matching this rule.
-    /// The lookback window will be at least as large as this value.
     pub max_secret_len: usize,
 }
 
@@ -22,7 +21,7 @@ impl MaskRule {
         })
     }
 
-    /// Common preset for OpenAI / Anthropic / Generic API keys
+    /// Common presets for OpenAI, Anthropic, and Generic Bearer API tokens
     pub fn standard_api_keys() -> Vec<Self> {
         vec![
             Self::new(
@@ -49,19 +48,8 @@ impl MaskRule {
 
 /// A sliding-window lookback streaming secret masker.
 ///
-/// Solves the split-secret boundary problem in HTTP/SSE LLM streaming responses:
-/// when a secret (e.g. `sk-...`) is partitioned across two or more streaming chunks,
-/// naive chunk-by-chunk regex matching fails.
-///
-/// This masker maintains a bounded lookback buffer. On every incoming chunk:
-/// 1. Appends chunk bytes to the lookback carry buffer.
-/// 2. Performs regex matching across the aggregated window.
-/// 3. Replaces matched secrets with the specified redaction token.
-/// 4. Determines the safe emission boundary: any bytes older than the maximum
-///    potential secret prefix length (or immediately following a completed redaction)
-///    are emitted.
-/// 5. Retains only the ambiguous tail in the lookback buffer.
-/// 6. On `flush()`, evaluates and drains the remaining tail.
+/// Handles arbitrary chunk fragmentation, streaming TCP splits, and byte-by-byte
+/// delivery in LLM/SSE proxies.
 #[derive(Debug)]
 pub struct StreamingLookbackMasker {
     rules: Vec<MaskRule>,
@@ -72,7 +60,6 @@ pub struct StreamingLookbackMasker {
 }
 
 impl StreamingLookbackMasker {
-    /// Creates a new streaming lookback masker with the provided rules.
     pub fn new(rules: Vec<MaskRule>) -> Self {
         let max_lookback = rules
             .iter()
@@ -89,12 +76,10 @@ impl StreamingLookbackMasker {
         }
     }
 
-    /// Creates a default masker configured with standard LLM/API key patterns.
     pub fn standard() -> Self {
         Self::new(MaskRule::standard_api_keys())
     }
 
-    /// Process an incoming stream chunk. Returns the safe-to-emit masked bytes.
     pub fn process_chunk(&mut self, chunk: &[u8]) -> Vec<u8> {
         if chunk.is_empty() {
             return Vec::new();
@@ -106,8 +91,6 @@ impl StreamingLookbackMasker {
         self.redact_and_emit(false)
     }
 
-    /// Flush all remaining bytes at stream completion (EOF or SSE [DONE]).
-    /// Returns any remaining masked bytes and clears the buffer.
     pub fn flush(&mut self) -> Vec<u8> {
         if self.carry_buffer.is_empty() {
             return Vec::new();
@@ -116,27 +99,14 @@ impl StreamingLookbackMasker {
         self.redact_and_emit(true)
     }
 
-    /// Internal redaction and emission logic.
     fn redact_and_emit(&mut self, is_flush: bool) -> Vec<u8> {
-        // Attempt UTF-8 conversion of carry_buffer.
-        // If not valid UTF-8, we find the longest valid UTF-8 prefix.
         let (valid_len, _) = match std::str::from_utf8(&self.carry_buffer) {
             Ok(s) => (s.len(), 0),
-            Err(e) => {
-                let valid_up_to = e.valid_up_to();
-                if is_flush {
-                    // At flush, take what we can
-                    (valid_up_to, self.carry_buffer.len() - valid_up_to)
-                } else {
-                    // Wait for more bytes to complete the UTF-8 codepoint
-                    (valid_up_to, self.carry_buffer.len() - valid_up_to)
-                }
-            }
+            Err(e) => (e.valid_up_to(), self.carry_buffer.len() - e.valid_up_to()),
         };
 
         if valid_len == 0 {
             if is_flush {
-                // Drain everything as raw bytes
                 return std::mem::take(&mut self.carry_buffer);
             }
             return Vec::new();
@@ -145,8 +115,8 @@ impl StreamingLookbackMasker {
         let mut text = String::from_utf8_lossy(&self.carry_buffer[..valid_len]).into_owned();
         let remaining_invalid_bytes = self.carry_buffer[valid_len..].to_vec();
 
-        // Track last match end index in text
-        let mut last_redacted_end = 0;
+        let mut last_match_end_in_original = 0;
+        let mut touches_bleeding_edge = false;
 
         for rule in &self.rules {
             let mut result = String::with_capacity(text.len());
@@ -154,11 +124,20 @@ impl StreamingLookbackMasker {
             let mut rule_matches = 0;
 
             for mat in rule.pattern.find_iter(&text) {
+                // Critical streaming invariant:
+                // If not flushing, and the match reaches the very end of the current buffer,
+                // the secret may still be growing in subsequent chunks!
+                // Hold this match until a delimiter closes it or EOF is reached.
+                if !is_flush && mat.end() == text.len() {
+                    touches_bleeding_edge = true;
+                    break;
+                }
+
                 result.push_str(&text[cursor..mat.start()]);
                 result.push_str(&rule.replacement);
                 cursor = mat.end();
                 rule_matches += 1;
-                last_redacted_end = result.len();
+                last_match_end_in_original = mat.end();
             }
 
             if rule_matches > 0 {
@@ -169,43 +148,36 @@ impl StreamingLookbackMasker {
         }
 
         if is_flush {
-            // Everything is safe to emit
             let mut output = text.into_bytes();
             output.extend_from_slice(&remaining_invalid_bytes);
             self.carry_buffer.clear();
             return output;
         }
 
-        // Determine safe emission point
         let total_len = text.len();
 
-        let safe_cut_point = if total_len <= self.max_lookback {
-            // Buffer is not full enough to guarantee no split secret prefix
-            // UNLESS a redaction occurred and the trailing unredacted part is 0
-            if last_redacted_end == total_len {
-                total_len
+        let safe_cut_point = if touches_bleeding_edge {
+            // A match is currently active at the trailing edge of the buffer.
+            // Retain from before the match start or keep bounded window.
+            if total_len > self.max_lookback {
+                total_len - self.max_lookback
             } else {
                 0
             }
+        } else if total_len <= self.max_lookback {
+            0
         } else {
-            let unredacted_tail_len = total_len - last_redacted_end;
-            if unredacted_tail_len > self.max_lookback {
-                // The safe boundary is at least total_len - max_lookback
-                total_len - self.max_lookback
-            } else {
-                // The redacted section is safe up to last_redacted_end
-                last_redacted_end
-            }
+            // Buffer is larger than max_lookback.
+            // Any bytes older than max_lookback cannot be part of an incoming prefix.
+            total_len - self.max_lookback
         };
 
         if safe_cut_point == 0 {
-            // Keep full text in carry buffer
             self.carry_buffer = text.into_bytes();
             self.carry_buffer.extend_from_slice(&remaining_invalid_bytes);
             return Vec::new();
         }
 
-        // Split text at safe_cut_point (ensuring char boundary)
         let cut_idx = floor_char_boundary(&text, safe_cut_point);
 
         let safe_text = &text[..cut_idx];
@@ -219,7 +191,6 @@ impl StreamingLookbackMasker {
         output
     }
 
-    /// Reset internal state
     pub fn reset(&mut self) {
         self.carry_buffer.clear();
         self.total_bytes_processed = 0;
@@ -231,7 +202,6 @@ impl StreamingLookbackMasker {
     }
 }
 
-/// Helper: find nearest valid UTF-8 character boundary <= index
 fn floor_char_boundary(s: &str, index: usize) -> usize {
     if index >= s.len() {
         return s.len();
@@ -241,39 +211,4 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
         i -= 1;
     }
     i
-}
-
-/// Server-Sent Events (SSE) aware streaming masker.
-///
-/// Wraps `StreamingLookbackMasker` and parses incoming SSE data lines (`data: ...\n\n`),
-/// applies lookback masking across the event contents, and formats valid output SSE streams.
-#[derive(Debug)]
-pub struct SseStreamMasker {
-    masker: StreamingLookbackMasker,
-}
-
-impl SseStreamMasker {
-    pub fn new(rules: Vec<MaskRule>) -> Self {
-        Self {
-            masker: StreamingLookbackMasker::new(rules),
-        }
-    }
-
-    pub fn standard() -> Self {
-        Self {
-            masker: StreamingLookbackMasker::standard(),
-        }
-    }
-
-    pub fn process_chunk(&mut self, chunk: &[u8]) -> Vec<u8> {
-        self.masker.process_chunk(chunk)
-    }
-
-    pub fn flush(&mut self) -> Vec<u8> {
-        self.masker.flush()
-    }
-
-    pub fn total_matches(&self) -> usize {
-        self.masker.total_matches()
-    }
 }

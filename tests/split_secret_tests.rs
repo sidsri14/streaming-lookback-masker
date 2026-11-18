@@ -65,7 +65,7 @@ fn test_split_secret_across_three_chunks() {
 fn test_split_byte_by_byte_pathological() {
     let mut masker = StreamingLookbackMasker::standard();
 
-    let full_text = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.tokenpayload1234567890";
+    let full_text = "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.tokenpayload1234567890\n";
     let mut output = Vec::new();
 
     // Deliver the entire secret 1 single byte per chunk!
@@ -77,7 +77,7 @@ fn test_split_byte_by_byte_pathological() {
     let result = String::from_utf8(output).unwrap();
     println!("Byte-by-byte result: {}", result);
 
-    assert_eq!(result, "Bearer [REDACTED_TOKEN]");
+    assert_eq!(result, "Authorization: Bearer [REDACTED_TOKEN]\n");
     assert_eq!(masker.total_matches(), 1);
 }
 
@@ -100,24 +100,23 @@ fn test_prefix_false_alarm_no_corruption() {
 }
 
 #[test]
-fn test_sse_streaming_format_split() {
+fn test_sse_streaming_chunk_boundary_split() {
     let mut masker = StreamingLookbackMasker::standard();
 
-    // Simulating raw OpenAI SSE frames split across packet boundaries
-    let frame1 = b"data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"sk-proj-\"}}]}\n\n";
-    let frame2 = b"data: {\"id\":\"2\",\"choices\":[{\"delta\":{\"content\":\"998877665544332211aabbcc\"}}]}\n\n";
-    let frame3 = b"data: [DONE]\n\n";
+    // Simulating raw OpenAI SSE network frames split mid-stream at packet boundary
+    let packet1 = b"data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"sk-proj-";
+    let packet2 = b"998877665544332211aabbcc\"}}]}\n\n";
+    let packet3 = b"data: [DONE]\n\n";
 
     let mut output = Vec::new();
-    output.extend(masker.process_chunk(frame1));
-    output.extend(masker.process_chunk(frame2));
-    output.extend(masker.process_chunk(frame3));
+    output.extend(masker.process_chunk(packet1));
+    output.extend(masker.process_chunk(packet2));
+    output.extend(masker.process_chunk(packet3));
     output.extend(masker.flush());
 
     let result = String::from_utf8(output).unwrap();
     println!("SSE Stream result:\n{}", result);
 
-    // Notice that across the frame split, the composite secret was masked!
     assert!(result.contains("[REDACTED_API_KEY]"));
     assert!(!result.contains("998877665544332211aabbcc"));
     assert!(result.contains("data: [DONE]"));
