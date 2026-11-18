@@ -1,0 +1,11 @@
+[package]
+name = "streaming-lookback-masker"
+version = "0.1.0"
+edition = "2021"
+authors = ["Siddharth Srivastava <sidsri1502@gmail.com>"]
+description = "Bounded-buffer sliding-window streaming secret masker for LLM/SSE proxies with split-token protection."
+
+[dependencies]
+regex = "1.10"
+
+[dev-dependencies]
