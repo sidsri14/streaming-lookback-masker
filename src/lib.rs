@@ -115,7 +115,6 @@ impl StreamingLookbackMasker {
         let mut text = String::from_utf8_lossy(&self.carry_buffer[..valid_len]).into_owned();
         let remaining_invalid_bytes = self.carry_buffer[valid_len..].to_vec();
 
-        let mut last_match_end_in_original = 0;
         let mut touches_bleeding_edge = false;
 
         for rule in &self.rules {
@@ -137,7 +136,6 @@ impl StreamingLookbackMasker {
                 result.push_str(&rule.replacement);
                 cursor = mat.end();
                 rule_matches += 1;
-                last_match_end_in_original = mat.end();
             }
 
             if rule_matches > 0 {
